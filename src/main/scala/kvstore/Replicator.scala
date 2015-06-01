@@ -22,42 +22,51 @@ class Replicator(val replica: ActorRef) extends Actor {
   import Replica._
   import context.dispatcher
 
-  /*
-   * The contents of this actor is just a suggestion, you can implement it in any way you like.
-   */
+    /*
+     * The contents of this actor is just a suggestion, you can implement it in any way you like.
+     */
 
-  // map from sequence number to pair of sender and request
-  var acks = Map.empty[Long, (ActorRef, Replicate)]
-  // a sequence of not-yet-sent snapshots (you can disregard this if not implementing batching)
-  var pending = Vector.empty[Snapshot]
+    // map from sequence number to pair of sender and request
+    var acks = Map.empty[Long, (ActorRef, Replicate)]
+    // a sequence of not-yet-sent snapshots (you can disregard this if not implementing batching)
+    var pending = Vector.empty[Snapshot]
 
-  var seqToSnapOp: Map[Long, Cancellable] = Map.empty[Long, Cancellable]
-
-  var _seqCounter = 0L
-
-  def nextSeq = {
-    val ret = _seqCounter
-    _seqCounter += 1
-    ret
-  }
-
-
-  /* TODO Behavior for the Replicator. */
-  def receive: Receive = {
-    case rep@Replicate(key, valueOpt, id) =>
-    {
-      val snapshot = Snapshot(key, valueOpt, _seqCounter)
-      acks += _seqCounter -> (sender, rep)
-      val op = context.system.scheduler.schedule(0 millis, 100 millis){replica ! snapshot}
-      seqToSnapOp +=_seqCounter -> op
+    var cancelTokens = Map.empty[Long,Cancellable]
+    var _seqCounter = 0L
+    def nextSeq = {
+        val ret = _seqCounter
+        _seqCounter += 1
+        ret
     }
-    case SnapshotAck(key, seq) =>
-    {
-      seqToSnapOp.get(seq).map(_.cancel())
-      acks.get(seq).map{case (req, rep) => req ! Replicated(rep.key, rep.id)}
-      nextSeq
+
+    /* TODO Behavior for the Replicator. */
+    def receive: Receive = {
+        case rep@Replicate(key, valueOption, id) =>
+            acks += ((_seqCounter,(sender, rep )))
+            replica ! Snapshot(key,valueOption,_seqCounter)
+            cancelTokens += ((_seqCounter, context.system.scheduler.schedule(30 millis, 80 millis,replica, Snapshot(key,valueOption,_seqCounter))))
+            nextSeq
+        // replica ! Snapshot(key,valueOption,nextSeq)
+        case SnapshotAck(key, seq) =>
+            //println("seq: "+seq +" the rest :"+acks(seq))
+            acks.get(seq) match {
+                case Some((s, act)) =>
+                    //println("From replicator, replicated id :" + act.id + " seq. number: "+ seq)
+                    s!Replicated(act.key,act.id)
+                    cancelTokens.get(seq) match {
+                        case Some(c)=>
+                            c.cancel()
+                        //cancelTokens -= (seq)
+                        case _ =>
+                    }
+                // acks -= (seq)
+                case _ =>  println("Unexpected case in Replicator")
+            }
+        //acks -= (seq)
+        //cancelTokens(seq).cancel()
+        //cancelTokens -= (seq)
+
+        case _ =>
     }
-    case _ => println("Replicator receive - unknown message!")
-  }
 
 }

@@ -42,186 +42,245 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     import Replicator._
     import Persistence._
     import context.dispatcher
-
     /*
-     * The contents of this actor is just a suggestion, you can implement it in any way you like.
-     */
+       * The contents of this actor is just a suggestion, you can implement it in any way you like.
+       */
+    val system = akka.actor.ActorSystem("system")
 
-    var expectedSeq: Long = 0L
+    // Internal Persist actor
+    val persist = context.actorOf(persistenceProps)
 
     var kv = Map.empty[String, String]
     // a map from secondary replicas to replicators
     var secondaries = Map.empty[ActorRef, ActorRef]
     // the current set of replicators
     var replicators = Set.empty[ActorRef]
-
-    var replicationSet = Set.empty[ActorRef]
-
-    def persistence = context.system.actorOf(persistenceProps)
-
-    override val supervisorStrategy = OneForOneStrategy(10) {
-        case _: Exception =>
-            SupervisorStrategy.restart
-    }
-
-    var opPesistedAckn: Map[Long, OpProcessindData] = Map.empty[Long, OpProcessindData]
-
-    var seqToReplicator: Map[Long, ActorRef] = Map.empty[Long, ActorRef]
-
-    var seqToSnapShot: Map[Long, Snapshot] = Map.empty[Long, Snapshot]
-
-    var repAckn: Map[ActorRef, Long] = Map.empty[ActorRef, Long]
-
-    var operationAckn: Map[Long, (Boolean, Boolean)] = Map.empty[Long, (Boolean, Boolean)]
-
-    // register self in a Arbiter
+    // used to manage snapshots
+    var expected = 0L
+    // join an arbiter
     arbiter ! Join
 
-    context.watch(self)
+    // hold cancellation tokens for persistence retry operation
+    var cancelTokens = Map.empty[Long, Cancellable]
+
+    // token for cancel  - send OperationFailed message within 1 second
+    var cancelFailureToken = Map.empty[Long, Cancellable]
+
+    // map from request id to client ActorRef
+    var clients = Map.empty[Long, ActorRef]
+
+    // map from key to request id
+    var keyId = Map.empty[String, Long]
+
+    // id generator
+    var _id = 0L
+
+    def nextId = {
+        val ret = _id
+        _id += 1
+        ret
+    }
+
+    var _inValue = 0
+
+    def nextVal = {
+        val r = _inValue
+        _inValue += 1
+        r
+    }
+
+    var persisted = Set.empty[Long]
+
+    var inReplication = Set.empty[ActorRef]
+    //var inReplication = 0
+
+    var idToPersisted = Map.empty[Long, Boolean]
+
+    var internalReplicationIds = Set.empty[Long]
+
+    var replicatorToUnacknowledgedIds = Map.empty[ActorRef, Set[Long]]
+
+    var internalReplicators = Set.empty[ActorRef]
+
+    var internalSecondaries = Map.empty[ActorRef, ActorRef]
+
+    var idToAcknowledged = Set.empty[Long]
+
+    var pendingSecondaries = Map.empty[ActorRef, ActorRef]
+
+
+    override val supervisorStrategy = OneForOneStrategy() {
+        case _ : PersistenceException => Restart
+    }
 
     def receive = {
-        case JoinedPrimary => context.become(leader)
+        case JoinedPrimary   => context.become(leader)
         case JoinedSecondary => context.become(replica)
     }
 
+    context.watch(self)
+
     /* TODO Behavior for  the leader role. */
     val leader: Receive = {
-        case ins@Insert(key, value, id) => {
-            opProcessing(id, key, Some(value), sender)
+        case Insert(key, value, id) =>
+            // println("Insert  key:"+ key +" value: "+value + " id : "+id + " number of replicas: "+replicators.size)
+            // increment number of needed replications
+
+            clients += id -> sender
+            keyId += key -> id
+            kv += key -> value
+
+            idToPersisted += id -> false
+            idToAcknowledged += id
+
+            cancelTokens += ((id,system.scheduler.schedule(0 millis, 100 millis, persist, Persist(key, Some(value), id))))
+
             replicators.foreach{replicator =>
                 replicator ! Replicate(key, Some(value), id)
-                repAckn +=  replicator -> id
+                inReplication += replicator
+                replicatorToUnacknowledgedIds += replicator -> Set.empty[Long]
+                replicatorToUnacknowledgedIds += replicator -> (replicatorToUnacknowledgedIds(replicator)+id)
             }
-        }
-        case rm@Remove(key, id) => {
-            opProcessing(id, key, None, sender)
-            replicators.foreach{replicator =>
-                replicator ! Replicate(key, None, id)
-                repAckn += replicator -> id
+            cancelFailureToken += (( id, system.scheduler.scheduleOnce(1.seconds){
+                clients(id) ! OperationFailed(id)
+            }))
+        //context.sender ! OperationAck(id)
+        case Get(key, id) => sender ! GetResult(key, kv.get(key), id)
+
+        case Remove(key, id) =>
+            //println("Remove  key:"+ key + " id : "+id + "number of replicas: "+replicators.size)
+            clients += ((id,sender))
+            keyId += key -> id
+            kv= kv -(key)
+            idToAcknowledged += id
+            idToPersisted += id->false
+            cancelTokens += ((id,system.scheduler.schedule(0 millis,100 millis,persist,Persist(key,None,id))))
+
+            cancelFailureToken += (( id,system.scheduler.scheduleOnce(1.seconds){
+                clients(id) ! OperationFailed(id)
+            }))
+
+            // replicate changes to all replicas
+            replicators.foreach{f=>
+                f! Replicate(key,None,id)
+                inReplication += f
+                replicatorToUnacknowledgedIds += f->Set.empty[Long]
+                replicatorToUnacknowledgedIds += f->(replicatorToUnacknowledgedIds(f)+id)
             }
-        }
-        case get@Get(key, id) => {
-            sender ! GetResult(key, kv.get(key), id)
-        }
-        case Persisted(key, id) => {
-            acknowledgement(id)
-        }
-        case Replicas(replicas) => {
-            val newReplicas = replicas - self
-            if(secondaries.isEmpty){
-                replicate(newReplicas)
+
+        //context.sender ! OperationAck(id)
+        case Replicas(replicas) =>
+            var newSecondaries = Set.empty[ActorRef]
+            secondaries.foreach(p=> newSecondaries += p._1)
+            if(replicas.filter(p=>p!=self) != newSecondaries){
+                println("ooo")
+                internalReplicationIds = Set()
+                replicas.filter(p=>p!=self).foreach(replica=>{
+                    if(!secondaries.contains(replica)){
+                        var rep = context.actorOf(Replicator.props(replica))
+                        replicatorToUnacknowledgedIds += rep->Set.empty[Long]
+                        //var inRep = context.actorOf(InternalReplicator.props(replica))
+                        replicators += rep
+                        //internalReplicators += inRep
+                        pendingSecondaries += rep->replica
+                        secondaries += replica -> rep
+                        // internalSecondaries += replica -> inRep
+                        kv.foreach(pair=>{
+                            rep ! Replicate(pair._1,Some(pair._2),keyId(pair._1))
+                            // internalReplicationIds += keyId(pair._1)
+                        })
+                    }
+                })
+                secondaries.foreach(pair =>{
+                    if(!replicas.contains(pair._1)){
+                        replicators -= pair._2
+                        //context.stop(pair._2)
+                        pair._2 ! PoisonPill
+                        secondaries -= pair._1
+                        // ??????
+                        //context.stop(pair._1)
+                        inReplication -= pair._2
+                        if(replicatorToUnacknowledgedIds.contains(pair._2))
+                            replicatorToUnacknowledgedIds(pair._2).foreach(id=>{
+                                if(cancelFailureToken.contains(id))
+                                    cancelFailureToken(id).cancel()
+                                if(idToPersisted.contains(id)&&idToPersisted(id)){
+                                    clients(id) ! OperationAck(id)
+                                }
+                            })
+
+                    }
+                })
             }
-            else
-            {
-                val currentReplicas = secondaries.toSet[(ActorRef, ActorRef)].map(_._1)
-                val replicasToStop = currentReplicas -- newReplicas
-                val replicatorsToStop = secondaries.filter(el => replicasToStop.contains(el._1)).toSet[(ActorRef, ActorRef)].map(_._2)
-                replicatorsToStop.foreach{replicator =>
-                    val id = repAckn.get(replicator)
-                    repAckn -= replicator
-                    replicators -= replicator
-                    id.map(acknowledgement(_))
-                    context.system.stop(replicator)
+
+        case Replicated(key, id) =>
+            internalReplicationIds  -= id
+            //
+            if(replicatorToUnacknowledgedIds.contains(sender))
+                replicatorToUnacknowledgedIds += sender -> (replicatorToUnacknowledgedIds(sender)-id)
+            if(idToPersisted.contains(id))
+                if(idToPersisted(id) && replicators.forall(r=> !replicatorToUnacknowledgedIds(r).contains(id))){
+                    if(idToAcknowledged.contains(id)){
+                        cancelFailureToken(id).cancel()
+                        if(clients.contains(id))
+                            clients(id) ! OperationAck(id)
+                        idToAcknowledged -= id
+                    }
                 }
-                replicasToStop.foreach{replica =>
-                    secondaries -= replica
-                    replica ! PoisonPill
-                }
-                val replicasToReplicate = currentReplicas -- newReplicas
-                replicate(replicasToReplicate)
+
+        case Persisted(key,id)=>
+            // println("From leader Persisted id: " + id)
+
+            idToPersisted += id->true
+            persisted += id
+            if(cancelTokens.contains(id))
+                cancelTokens(id).cancel()
+            //if(inReplication.isEmpty){
+            if(replicators.forall(r=> !replicatorToUnacknowledgedIds(r).contains(id))){
+                cancelFailureToken(id).cancel()
+                idToAcknowledged -= id
+                if(clients.contains(id))
+                    clients(id) ! OperationAck(id)
             }
-
-        }
-        case Replicated(key, id) => {
-            repAckn -= sender
-            if(repAckn.isEmpty)
-            opPesistedAckn.get(id).map { opProcessData =>
-                opProcessData.opTimeOut.cancel()
-                opProcessData.requester ! OperationAck(id)
-                opPesistedAckn -= id
-            }
-        }
+        case _ => println("Unexpected message")
     }
-
-    def replicate(replicas: Set[ActorRef]) =
-    {
-        replicas.foreach{replica =>
-            val replicator = context.system.actorOf(Replicator.props(replica))
-            secondaries += replica -> replicator
-            replicators += replicator
-            kv.foreach{case (k, v) =>
-                val id = Random.nextLong
-                replicator ! Replicate(k, Some(v), id)
-                repAckn += replicator -> id
-            }
-        }
-    }
-
-    def acknowledgement(id: Long) = {
-        opPesistedAckn.get(id).map{opProcessData =>
-            opProcessData.persistOp.cancel()
-            context.system.stop(opProcessData.persistActor)
-            if(repAckn.find(el => el._2 == id).isEmpty)
-            {
-                opProcessData.opTimeOut.cancel()
-                opPesistedAckn -= id
-                opProcessData.requester ! OperationAck(id)
-            }
-        }
-    }
-
-    def opProcessing(id: Long, key: String, value: Option[String], requester: ActorRef) = {
-        // persist block
-        val persAct = persistence
-        val persistOP = context.system.scheduler.schedule(0 millis, 100 millis){
-            persAct ! Persist(key, value, id)
-        }
-        val opTimeOut = context.system.scheduler.scheduleOnce(1 second){
-            persistOP.cancel()
-            context.system.stop(persAct)
-            requester ! OperationFailed(id)
-            opPesistedAckn -= id
-        }
-        opPesistedAckn += id -> OpProcessindData(persistOP, opTimeOut, persAct, requester)
-
-        // update kv block
-        value match
-        {
-            case Some(v) => kv += key -> v
-            case None => kv -= key
-        }
-    }
-    case class OpProcessindData(persistOp: Cancellable, opTimeOut: Cancellable, persistActor: ActorRef, requester: ActorRef)
 
     /* TODO Behavior for the replica role. */
     val replica: Receive = {
-        case get@Get(key, id) => {
-            sender ! GetResult(key, kv.get(key), id)
-        }
-        case snap@Snapshot(key, valueOpt, seq) => {
-            if (seq < expectedSeq)
+        case Get(key,id) => sender ! GetResult(key, kv.get(key), id)
+
+        case Snapshot(key, valueOption, seq) =>
+            // println("From replica recived snapshot  seq =" + seq)
+            secondaries += ((self, sender))
+            if(seq<expected)
                 sender ! SnapshotAck(key, seq)
-            else if (seq == expectedSeq && seqToReplicator.get(seq).isEmpty) {
-                seqToReplicator += seq -> sender
-                seqToSnapShot += seq -> snap
-                opProcessing(seq, key, valueOpt, self)
+            else if(seq == expected){
+                valueOption match {
+                    case Some(value) =>
+                        kv += ((key, value))
+                        //create local persistence actor
+
+                        //repeat persistence until succeed
+                        // println("From Secondary replica persistence seq = "+ seq)
+                        cancelTokens += ((seq, system.scheduler.schedule(0 millis, 100 millis, persist, Persist(key,valueOption,seq))))
+                    //persist ! Persist(key,valueOption,seq)
+                    //sender ! SnapshotAck(key, seq)
+                    case None => kv -= (key);
+                        //sender ! SnapshotAck(key, seq)
+                        cancelTokens += ((seq,system.scheduler.schedule(0 millis, 100 millis, persist, Persist(key,valueOption,seq))))
+                }
+                expected = seq+1
             }
-        }
-        case Persisted(key, id) => {
-            acknowledgement(id)
-        }
-        case OperationAck(id) => {
-            seqToSnapShot.get(id).map{snap =>
-                seqToReplicator.get(id).map{_ ! SnapshotAck(snap.key, id)}
-                seqToSnapShot -= id
-            }
-            seqToReplicator -= id
-            if (expectedSeq < id + 1) expectedSeq += 1
-        }
-        case OperationFailed(id) => {
-            println(s"Secondary replica op: $id persistent failed!")
-        }
-        case _ => println("Unknown message")
+            else //if(seq > expected)
+                println("we do nothing here")
+        //       else
+        //         expected += 1
+        case Persisted(key,id)=>
+            if(cancelTokens.contains(id))
+                cancelTokens(id).cancel()
+            if(secondaries.contains(self))
+                secondaries(self) ! SnapshotAck(key, id)
+        case _ =>
     }
 
 }
